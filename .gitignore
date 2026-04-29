@@ -1,0 +1,6 @@
+/.cache
+/.ratings.db
+/.venv
+/__pycache__
+/build
+/dist
