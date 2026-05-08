@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Windows launcher for Photo Cull web app.
+"""Portable GUI launcher for Photo Cull web app.
 
 Launch flow:
 1) Prompt user for photo directory (unless provided as argument)
@@ -118,14 +118,14 @@ def _run_startup_dialog(
     def _cancel():
         root.destroy()
 
-    FONT = ("Segoe UI", 9)
-    FONT_BOLD = ("Segoe UI", 9, "bold")
+    FONT = ("TkDefaultFont", 9)
+    FONT_BOLD = ("TkDefaultFont", 9, "bold")
     ENTRY_W = 44
 
     outer = tk.Frame(root, padx=20, pady=16)
     outer.pack()
 
-    tk.Label(outer, text="Photo Cull", font=("Segoe UI", 13, "bold")).grid(
+    tk.Label(outer, text="Photo Cull", font=("TkDefaultFont", 13, "bold")).grid(
         row=0, column=0, columnspan=3, pady=(0, 14), sticky="w"
     )
 
@@ -178,7 +178,7 @@ def _find_free_port(host: str, preferred_port: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Photo Cull Windows launcher"
+        description="Photo Cull portable launcher"
     )
     parser.add_argument(
         "directory",
@@ -298,16 +298,16 @@ def _run_control_window(app_url: str) -> None:
     tk.Label(
         root,
         text="Photo Cull is running",
-        font=("Segoe UI", 11, "bold"),
+        font=("TkDefaultFont", 11, "bold"),
     ).pack(**pad)
 
     url_frame = tk.Frame(root)
     url_frame.pack(padx=16, pady=(0, 4))
-    tk.Label(url_frame, text="URL:", font=("Segoe UI", 9)).pack(side="left")
+    tk.Label(url_frame, text="URL:", font=("TkDefaultFont", 9)).pack(side="left")
     url_var = tk.StringVar(value=app_url)
     url_entry = tk.Entry(
         url_frame, textvariable=url_var, state="readonly",
-        font=("Segoe UI", 9), width=32, relief="flat",
+        font=("TkDefaultFont", 9), width=32, relief="flat",
     )
     url_entry.pack(side="left", padx=(4, 0))
 

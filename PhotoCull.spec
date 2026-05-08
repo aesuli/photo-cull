@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['photo_cull_windows.py'],
+    ['photo_cull_portable.py'],
     pathex=[],
     binaries=[],
     datas=[('static', 'static')],

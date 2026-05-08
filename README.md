@@ -1,6 +1,6 @@
 # Photo Cull
 
-Photo Cull is a web app/windows app for quickly browsing folders of photos, assigning ratings, and downloading selected files.
+Photo Cull is a web app with a portable GUI launcher for quickly browsing folders of photos, assigning ratings, and downloading selected files.
 
 It is designed for fast culling workflows: run locally, work on a browser, and rate images directly from your own filesystem.
 
@@ -44,11 +44,11 @@ Photo Cull stores app data outside your original photo files:
 By default, storage location depends on how you launch the app:
 
 - `photo_cull.py`: current working directory unless `--data-dir` is set.
-- `photo_cull_windows.py`: executable directory unless changed in startup dialog or with `--data-dir`.
+- `photo_cull_portable.py`: executable directory unless changed in startup dialog or with `--data-dir`.
 
 ## Running Photo Cull
 
-Photo Cull can be run from source or you can download a **self-contained, portable executable for Windows** from the [releases](releases).
+Photo Cull can be run from source or you can download a **self-contained, portable executable** from the [releases](releases).
 
 To run from source, follow this steps:
 
@@ -88,10 +88,10 @@ To run from source, follow this steps:
 
     - `http://127.0.0.1:12121`
 
-* Run Windows launcher
+* Run portable launcher
 
     ```bash
-    python photo_cull_windows.py
+    python photo_cull_portable.py
     ```
 
     What it does:
@@ -105,7 +105,7 @@ To run from source, follow this steps:
     ![Photo Cull running dialog](windows_run.png)
 
     - Opens your default browser automatically.
-    - Remembers last selected directories in `%USERPROFILE%/.photocull/state.json`.
+    - Remembers last selected directories in `~/.photocull/state.json`.
 
     Optional arguments:
 
@@ -117,18 +117,36 @@ To run from source, follow this steps:
     Example:
 
     ```bash
-    python photo_cull_windows.py "D:/Pictures" --data-dir "D:/PhotoCullData" --port 13000
+    python photo_cull_portable.py "D:/Pictures" --data-dir "D:/PhotoCullData" --port 13000
     ```
 
-## Build Windows executable
+## Build portable executable
 
-Use the included batch file:
+Use the build script for your platform:
+
+**Windows:**
 
 ```bat
 build_windows_exe.bat
 ```
 
-The script will build a one-file GUI executable with static assets, saving it to `dist/PhotoCull.exe`
+Output: `dist\PhotoCull.exe`
+
+**Linux:**
+
+```bash
+bash build_linux.sh
+```
+
+Output: `dist/PhotoCull`
+
+**macOS:**
+
+```bash
+bash build_mac.sh
+```
+
+Output: `dist/PhotoCull.app`
 
 ## License
 
