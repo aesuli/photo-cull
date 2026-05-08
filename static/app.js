@@ -330,14 +330,90 @@ function toggleHelp() {
   setHelpVisible(helpModal.classList.contains('hidden'));
 }
 
+function decodeHeaderValue(value) {
+  if (!value) return '';
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function updateCellMetadata(index, item) {
+  const cell = grid.querySelector(`.cell[data-index="${index}"]`);
+  if (!cell) return;
+  const datetimeEl = cell.querySelector('.cell-info-chip.datetime');
+  const exifEl = cell.querySelector('.cell-info-chip.exif');
+  if (datetimeEl) {
+    datetimeEl.textContent = item.date && item.time ? `${item.date} ${item.time}` : item.date || item.time || '';
+  }
+  if (exifEl) {
+    exifEl.textContent = item.exif || 'no exif info';
+  }
+}
+
+function applyThumbMetadataUpdate(path, exif, exifUpdated) {
+  if (!exifUpdated) return;
+
+  const index = imageList.findIndex((item) => item.path === path);
+  if (index === -1) return;
+
+  const item = imageList[index];
+  const nextExif = exif || '';
+  const hasChanges = item.exif !== nextExif;
+  if (!hasChanges) return;
+
+  item.exif = nextExif;
+
+  updateCellMetadata(index, item);
+  if (fullPageIndex === index && !fullPageEl.classList.contains('hidden')) {
+    updateFullPageBar();
+  }
+}
+
+async function loadThumbnailImage(img) {
+  const src = img.dataset.src;
+  if (!src) {
+    img.classList.remove('lazy');
+    return;
+  }
+
+  try {
+    const res = await fetch(src);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const path = img.dataset.path || '';
+    if (path) {
+      const exifUpdated = res.headers.get('X-Photo-Exif-Updated') === '1';
+      const exif = decodeHeaderValue(res.headers.get('X-Photo-Exif') || '');
+      applyThumbMetadataUpdate(path, exif, exifUpdated);
+    }
+
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    img.onload = () => {
+      img.classList.remove('lazy');
+      URL.revokeObjectURL(objectUrl);
+    };
+    img.onerror = () => {
+      img.classList.remove('lazy');
+      URL.revokeObjectURL(objectUrl);
+    };
+    img.src = objectUrl;
+  } catch {
+    // Fallback to direct assignment if fetch fails for any reason.
+    img.onload = () => img.classList.remove('lazy');
+    img.onerror = () => img.classList.remove('lazy');
+    img.src = src;
+  }
+}
+
 /* ── Intersection Observer – lazy image loading ─────────────── */
 const imgObserver = new IntersectionObserver((entries) => {
   for (const entry of entries) {
     if (!entry.isIntersecting) continue;
     const img = entry.target;
-    img.src     = img.dataset.src;
-    img.onload  = () => img.classList.remove('lazy');
-    img.onerror = () => img.classList.remove('lazy');
+    loadThumbnailImage(img);
     imgObserver.unobserve(img);
   }
 }, { root: gallery, rootMargin: '400px' });
@@ -460,6 +536,7 @@ function renderGrid() {
 
     const img = document.createElement('img');
     img.dataset.src = `/thumb?path=${encodeURIComponent(item.path)}`;
+    img.dataset.path = item.path;
     img.alt = item.name;
     img.classList.add('lazy');
 

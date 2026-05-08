@@ -22,6 +22,7 @@ import cherrypy
 from html import escape
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import quote
 from cherrypy.lib import static as cherrypy_static
 from PIL import Image, ImageOps
 
@@ -80,6 +81,15 @@ def _rational_to_float(value):
     except (TypeError, ValueError, ZeroDivisionError):
         return None
 
+
+def _extract_exif_shot_datetime(exif):
+    """Return (date, time) from EXIF shot timestamp tags, or None if unavailable."""
+    for tag in (36867, 36868, 306):  # DateTimeOriginal, DateTimeDigitized, DateTime
+        dt_parts = _format_exif_datetime(exif.get(tag))
+        if dt_parts:
+            return dt_parts
+    return None
+
 class ApiHandler:
     """CherryPy sub-handler providing JSON endpoints for the SPA."""
 
@@ -137,10 +147,12 @@ class ApiHandler:
             entries = sorted(abs_dir.iterdir(), key=lambda p: p.name.lower())
         except PermissionError:
             return result
+        image_entries = [e for e in entries if e.is_file() and is_image_file(e.name)]
+        self._app._sync_directory_metadata(abs_dir, image_entries)
         for entry in entries:
             if entry.is_file() and is_image_file(entry.name):
                 rel_path = str(entry.relative_to(self._app.base_dir)).replace("\\", "/")
-                modified_date, modified_time, exif_info = self._app._get_image_metadata(entry)
+                modified_date, modified_time, exif_info = self._app._get_image_metadata_for_images(entry)
                 rating = self._app._get_rating(entry)
                 result.append({
                     "name": entry.name,
@@ -281,6 +293,11 @@ class PhotoCullingApp:
                 "CREATE TABLE IF NOT EXISTS ratings "
                 "(path TEXT PRIMARY KEY, rating TEXT NOT NULL)"
             )
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS image_metadata "
+                "(path TEXT PRIMARY KEY, date TEXT NOT NULL DEFAULT '', "
+                "time TEXT NOT NULL DEFAULT '', exif TEXT NOT NULL DEFAULT '')"
+            )
 
     def _rating_key(self, abs_path: Path) -> str:
         """Return a key relative to the base_dir."""
@@ -308,22 +325,26 @@ class PhotoCullingApp:
         with sqlite3.connect(self.db_path) as con:
             con.execute("DELETE FROM ratings WHERE path = ?", (key,))
 
-    def _get_image_metadata(self, abs_path: Path):
-        """Return (date, time, exif_info), preferring EXIF capture datetime over file mtime."""
-        exif_info = "no exif info"
-        # EXIF candidate tags: DateTimeOriginal, DateTimeDigitized, DateTime.
-        exif_datetime_keys = (36867, 36868, 306)
+    def _file_modified_metadata(self, abs_path: Path):
+        """Return (date, time) derived from file modification timestamp."""
+        try:
+            modified_dt = datetime.fromtimestamp(abs_path.stat().st_mtime)
+            return modified_dt.strftime("%Y-%m-%d"), modified_dt.strftime("%H:%M")
+        except OSError:
+            return "", ""
+
+    def _extract_exif_metadata_from_file(self, abs_path: Path):
+        """Return (shot_date, shot_time, exif_info) extracted from EXIF metadata."""
+        shot_date = ""
+        shot_time = ""
+        exif_info = ""
         try:
             with Image.open(abs_path) as img:
                 exif = img.getexif()
                 if exif:
-                    for key in exif_datetime_keys:
-                        formatted = _format_exif_datetime(exif.get(key))
-                        if formatted:
-                            exif_date, exif_time = formatted
-                            break
-                    else:
-                        exif_date, exif_time = None, None
+                    shot_dt = _extract_exif_shot_datetime(exif)
+                    if shot_dt:
+                        shot_date, shot_time = shot_dt
 
                     exif_parts = []
 
@@ -356,17 +377,88 @@ class PhotoCullingApp:
 
                     if exif_parts:
                         exif_info = " | ".join(exif_parts)
-
-                    if exif_date and exif_time:
-                        return exif_date, exif_time, exif_info
         except Exception:
             pass
+        return shot_date, shot_time, exif_info
 
-        try:
-            modified_dt = datetime.fromtimestamp(abs_path.stat().st_mtime)
-            return modified_dt.strftime("%Y-%m-%d"), modified_dt.strftime("%H:%M"), exif_info
-        except OSError:
-            return "", "", exif_info
+    def _get_db_image_metadata(self, abs_path: Path):
+        """Return (date, time, exif_info) from DB or None if missing."""
+        key = self._rating_key(abs_path)
+        with sqlite3.connect(self.db_path) as con:
+            row = con.execute(
+                "SELECT date, time, exif FROM image_metadata WHERE path = ?",
+                (key,),
+            ).fetchone()
+        if not row:
+            return None
+        return row[0] or "", row[1] or "", row[2] or ""
+
+    def _set_db_image_metadata(self, abs_path: Path, date: str, time: str, exif: str):
+        """Insert or update image metadata row."""
+        key = self._rating_key(abs_path)
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "INSERT INTO image_metadata (path, date, time, exif) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(path) DO UPDATE SET "
+                "date = excluded.date, time = excluded.time, exif = excluded.exif",
+                (key, date or "", time or "", exif or ""),
+            )
+
+    def _sync_directory_metadata(self, abs_dir: Path, image_entries: list[Path]):
+        """Ensure metadata rows mirror files in a directory, preserving stored creation dates."""
+        dir_rel = str(abs_dir.relative_to(self.base_dir)).replace("\\", "/")
+        if dir_rel == ".":
+            dir_rel = ""
+
+        current_keys = {self._rating_key(entry) for entry in image_entries}
+        with sqlite3.connect(self.db_path) as con:
+            metadata_rows = [row[0] for row in con.execute("SELECT path FROM image_metadata").fetchall()]
+            existing_keys = set(metadata_rows)
+
+            for db_key in metadata_rows:
+                normalized_key = str(db_key).replace("\\", "/")
+                parent_dir = normalized_key.rsplit("/", 1)[0] if "/" in normalized_key else ""
+                if parent_dir == dir_rel and db_key not in current_keys:
+                    con.execute("DELETE FROM image_metadata WHERE path = ?", (db_key,))
+
+            for entry in image_entries:
+                key = self._rating_key(entry)
+                if key in existing_keys:
+                    continue
+                shot_date, shot_time, exif_info = self._extract_exif_metadata_from_file(entry)
+                if shot_date and shot_time:
+                    created_date, created_time = shot_date, shot_time
+                else:
+                    created_date, created_time = self._file_modified_metadata(entry)
+                con.execute(
+                    "INSERT INTO image_metadata (path, date, time, exif) VALUES (?, ?, ?, ?)",
+                    (key, created_date, created_time, exif_info),
+                )
+
+    def _get_image_metadata_for_images(self, abs_path: Path):
+        """Return metadata for /images using DB first, then mtime fallback."""
+        db_metadata = self._get_db_image_metadata(abs_path)
+        if db_metadata is not None:
+            return db_metadata
+        fallback_date, fallback_time = self._file_modified_metadata(abs_path)
+        return fallback_date, fallback_time, ""
+
+    def _refresh_image_exif(self, abs_path: Path):
+        """Refresh EXIF info in DB and prefer EXIF shot time, with mtime fallback."""
+        before = self._get_db_image_metadata(abs_path)
+        shot_date, shot_time, latest_exif = self._extract_exif_metadata_from_file(abs_path)
+        if not shot_date or not shot_time:
+            shot_date, shot_time = self._file_modified_metadata(abs_path)
+
+        if before is None:
+            self._set_db_image_metadata(abs_path, shot_date, shot_time, latest_exif)
+            return latest_exif, True
+
+        date, time, old_exif = before
+        changed = (old_exif != latest_exif) or (date != shot_date) or (time != shot_time)
+        if changed:
+            self._set_db_image_metadata(abs_path, shot_date, shot_time, latest_exif)
+        return latest_exif, changed
 
     def _thumb_path(self, abs_path: Path) -> Path:
         """
@@ -622,6 +714,10 @@ class PhotoCullingApp:
 
         if not abs_path.is_file() or not is_image_file(abs_path):
             raise cherrypy.HTTPError(404, "Not Found")
+
+        refreshed_exif, exif_changed = self._refresh_image_exif(abs_path)
+        cherrypy.response.headers["X-Photo-Exif"] = quote(refreshed_exif or "", safe="")
+        cherrypy.response.headers["X-Photo-Exif-Updated"] = "1" if exif_changed else "0"
 
         thumb_path = self._ensure_thumbnail(abs_path)
 
