@@ -1,5 +1,14 @@
 'use strict';
 
+/* ── Utilities ──────────────────────────────────────────────── */
+function debounce(func, wait) {
+  let timeout;
+  return function(...args) {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func.apply(this, args), wait);
+  };
+}
+
 /* ── State ──────────────────────────────────────────────────── */
 let imageList  = [];   // [{name, path}, …]
 let cols       = 4;
@@ -20,6 +29,11 @@ let fullPageCounterVisible = true;
 let keyboardTarget = 'grid';
 let imageLoadRequestId = 0;
 let imageLoadController = null;
+let imageLoadProgressTimer = null;
+let gridRenderEpoch = 0;
+let photoStatsDirty = true;
+let previousSelectedIndexes = new Set();
+let previousActiveIndex = -1;
 let currentDir = '';
 let ratingSelector = null;
 let ratingSelectorBackdrop = null;
@@ -68,6 +82,31 @@ const fullPageInfo    = document.getElementById('fullpage-info');
 
 const SORT_SEQUENCE = ['name-asc', 'name-desc', 'datetime-asc', 'datetime-desc', 'rating-asc', 'rating-desc'];
 const SECONDARY_SORT_SEQUENCE = [...SORT_SEQUENCE];
+const LARGE_GRID_CHUNK_THRESHOLD = 800;
+
+const debouncedGroupNameRender = debounce(() => {
+  renderGrid();
+}, 220);
+
+grid.addEventListener('click', (event) => {
+  const ratingChip = event.target.closest('.cell-info-chip.rating');
+  if (ratingChip && grid.contains(ratingChip)) {
+    event.stopPropagation();
+    const ratingCell = ratingChip.closest('.cell');
+    const ratingIndex = Number.parseInt(ratingCell?.dataset.index || '', 10);
+    if (Number.isInteger(ratingIndex) && ratingIndex >= 0) {
+      openRatingSelector(ratingChip, ratingIndex);
+    }
+    return;
+  }
+
+  const cell = event.target.closest('.cell');
+  if (!cell || !grid.contains(cell)) return;
+
+  const index = Number.parseInt(cell.dataset.index || '', 10);
+  if (!Number.isInteger(index) || index < 0) return;
+  handleCellSelection(index, event);
+});
 
 function updateSortButton() {
   const labelByMode = {
@@ -245,6 +284,34 @@ function getPrimarySortKind(mode) {
   if (mode.startsWith('datetime-')) return 'datetime';
   if (mode.startsWith('rating-')) return 'rating';
   return 'name';
+}
+
+function sortModeUsesRating(mode) {
+  return typeof mode === 'string' && mode.startsWith('rating-');
+}
+
+function shouldResortAfterRatingChange() {
+  return sortModeUsesRating(sortMode) || sortModeUsesRating(secondarySortMode);
+}
+
+function resortAndRefreshAfterRatingChange(fullPagePath = '') {
+  const selectedPaths = new Set(getSelectedPaths());
+  const activePath = activeIndex >= 0 && activeIndex < imageList.length ? imageList[activeIndex].path : '';
+  const anchorPath = anchorIndex >= 0 && anchorIndex < imageList.length ? imageList[anchorIndex].path : '';
+
+  applyCurrentSort();
+  remapSelectionByPaths(selectedPaths, activePath, anchorPath);
+
+  if (fullPagePath && !fullPageEl.classList.contains('hidden')) {
+    fullPageIndex = imageList.findIndex((item) => item.path === fullPagePath);
+  }
+
+  renderGrid();
+  if (activeIndex !== -1) keepCellVisible(activeIndex);
+
+  if (fullPagePath && fullPageIndex >= 0 && !fullPageEl.classList.contains('hidden')) {
+    updateFullPageBar();
+  }
 }
 
 function setDateGroupingInterval(interval) {
@@ -425,20 +492,48 @@ function setColumns(n) {
   grid.style.setProperty('--cols', cols);
 }
 
+function markPhotoStatsDirty() {
+  photoStatsDirty = true;
+}
+
+function resetRenderedSelectionState() {
+  previousSelectedIndexes.clear();
+  previousActiveIndex = -1;
+}
+
+let lastStatsScale = 1;
+let statsBarResizeTimer = null;
+
 function fitStatsBarToWidth() {
   if (!statsBar || !statsBarWrap) return;
 
-  statsBar.style.transform = 'none';
-  const available = statsBarWrap.clientWidth;
-  const needed = statsBar.offsetWidth;
-  if (available <= 0 || needed <= 0) return;
+  // Clear any pending timer and debounce to avoid excessive calculations
+  if (statsBarResizeTimer) clearTimeout(statsBarResizeTimer);
+  
+  statsBarResizeTimer = setTimeout(() => {
+    requestAnimationFrame(() => {
+      statsBar.style.transform = 'none';
+      const available = statsBarWrap.clientWidth;
+      const needed = statsBar.offsetWidth;
+      if (available <= 0 || needed <= 0) return;
 
-  const scale = Math.min(1, available / needed);
-  statsBar.style.transform = scale < 0.999 ? `scaleX(${scale})` : 'none';
+      const scale = Math.min(1, available / needed);
+      // Only update if scale has changed significantly (avoid redundant updates)
+      if (Math.abs(scale - lastStatsScale) > 0.01) {
+        lastStatsScale = scale;
+        if (scale < 0.999) {
+          statsBar.style.transform = `scaleX(${scale})`;
+        } else {
+          statsBar.style.transform = 'none';
+        }
+      }
+    });
+  }, 50);
 }
 
 function updatePhotoStats() {
   if (!photoStats) return;
+  if (!photoStatsDirty) return;
 
   const counts = { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0, unrated: 0 };
   for (const item of imageList) {
@@ -485,14 +580,94 @@ function updatePhotoStats() {
 
   fitStatsBarToWidth();
   window.requestAnimationFrame(fitStatsBarToWidth);
+  photoStatsDirty = false;
 }
 
-function setGridLoading(isLoading) {
+function setGridLoading(isLoading, label = 'Loading images...') {
   grid.dataset.loading = isLoading ? 'true' : 'false';
+  if (isLoading) {
+    grid.dataset.loadingLabel = label;
+    return;
+  }
+  delete grid.dataset.loadingLabel;
+}
+
+function setGridLoadingLabel(label) {
+  if (grid.dataset.loading !== 'true') {
+    return;
+  }
+  grid.dataset.loadingLabel = label || 'Loading images...';
+}
+
+function createImageLoadId() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+    return window.crypto.randomUUID();
+  }
+  return `load-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function formatImageLoadProgress(progress) {
+  if (!progress || typeof progress !== 'object') {
+    return 'Loading images...';
+  }
+  const phase = String(progress.phase || 'Loading images').trim();
+  const processed = Number(progress.processed) || 0;
+  const total = Number(progress.total) || 0;
+  if (total > 0) {
+    const percent = Math.min(100, Math.round((processed / total) * 100));
+    return `${phase} (${processed}/${total}, ${percent}%)`;
+  }
+  return phase || 'Loading images...';
+}
+
+function stopImageLoadProgressPolling() {
+  if (imageLoadProgressTimer !== null) {
+    window.clearTimeout(imageLoadProgressTimer);
+    imageLoadProgressTimer = null;
+  }
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
+async function pollImageLoadProgress(loadId, requestId) {
+  if (requestId !== imageLoadRequestId || grid.dataset.loading !== 'true') {
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/load_progress?load_id=${encodeURIComponent(loadId)}`);
+    if (res.ok && requestId === imageLoadRequestId) {
+      const progress = await res.json();
+      setGridLoadingLabel(formatImageLoadProgress(progress));
+    }
+  } catch (error) {
+    if (requestId === imageLoadRequestId) {
+      setGridLoadingLabel('Loading images...');
+    }
+  }
+
+  if (requestId !== imageLoadRequestId || grid.dataset.loading !== 'true') {
+    return;
+  }
+
+  imageLoadProgressTimer = window.setTimeout(() => {
+    pollImageLoadProgress(loadId, requestId);
+  }, 250);
 }
 
 function renderGrid() {
+  const renderEpoch = ++gridRenderEpoch;
+  if (imageList.length > LARGE_GRID_CHUNK_THRESHOLD) {
+    void renderGridChunked(imageLoadRequestId, 600, renderEpoch);
+    return;
+  }
+
   imgObserver.disconnect();
+  resetRenderedSelectionState();
   grid.innerHTML = '';
   grid.style.setProperty('--cols', cols);
   grid.dataset.fitMode = fitMode;
@@ -501,6 +676,9 @@ function renderGrid() {
   setRatingsOverlayVisible(ratingsOverlayVisible);
 
   if (imageList.length === 0) {
+    if (grid.dataset.loading === 'true') {
+      return;
+    }
     const msg = document.createElement('p');
     msg.id = 'empty-msg';
     msg.textContent = 'No images in this folder.';
@@ -574,18 +752,9 @@ function renderGrid() {
     stars.textContent = ratingToStars(item.rating);
     stars.style.cursor = 'pointer';
 
-    stars.addEventListener('click', (event) => {
-      event.stopPropagation();
-      openRatingSelector(stars, index);
-    });
-
     bottom.appendChild(stars);
     info.appendChild(top);
     info.appendChild(bottom);
-
-    cell.addEventListener('click', (event) => {
-      handleCellSelection(index, event);
-    });
 
     cell.appendChild(img);
     cell.appendChild(info);
@@ -593,6 +762,120 @@ function renderGrid() {
     imgObserver.observe(img);
   });
   grid.appendChild(frag);
+  updateSelectionStyles();
+}
+
+async function renderGridChunked(requestId, chunkSize = 2000, renderEpoch = 0) {
+  imgObserver.disconnect();
+  resetRenderedSelectionState();
+  grid.innerHTML = '';
+  grid.style.setProperty('--cols', cols);
+  grid.dataset.fitMode = fitMode;
+  updatePhotoStats();
+  setInfoOverlayVisible(infoOverlayVisible);
+  setRatingsOverlayVisible(ratingsOverlayVisible);
+
+  if (imageList.length === 0) {
+    if (grid.dataset.loading === 'true') {
+      return;
+    }
+    const msg = document.createElement('p');
+    msg.id = 'empty-msg';
+    msg.textContent = 'No images in this folder.';
+    grid.appendChild(msg);
+    return;
+  }
+
+  const total = imageList.length;
+  const primarySortKind = getPrimarySortKind(sortMode);
+  const showGroupSeparators = groupSeparatorsVisible;
+  let previousGroupKey = null;
+
+  for (let start = 0; start < total; start += chunkSize) {
+    if (requestId !== imageLoadRequestId || (renderEpoch !== 0 && renderEpoch !== gridRenderEpoch)) {
+      return;
+    }
+
+    const end = Math.min(total, start + chunkSize);
+    const frag = document.createDocumentFragment();
+
+    for (let index = start; index < end; index += 1) {
+      const item = imageList[index];
+      const groupInfo = getGroupInfoForItem(item, primarySortKind);
+      const currentGroupKey = groupInfo.key;
+
+      if (showGroupSeparators && currentGroupKey !== previousGroupKey) {
+        const separator = document.createElement('div');
+        separator.className = 'rating-group-separator';
+
+        const label = document.createElement('span');
+        label.className = 'rating-group-label';
+        label.textContent = groupInfo.label;
+
+        separator.appendChild(label);
+        frag.appendChild(separator);
+        previousGroupKey = currentGroupKey;
+      }
+
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      cell.dataset.index = String(index);
+
+      const img = document.createElement('img');
+      img.dataset.src = `/thumb?path=${encodeURIComponent(item.path)}`;
+      img.dataset.path = item.path;
+      img.alt = item.name;
+      img.classList.add('lazy');
+
+      const info = document.createElement('div');
+      info.className = 'cell-info';
+
+      const top = document.createElement('div');
+      top.className = 'cell-info-top';
+
+      const name = document.createElement('span');
+      name.className = 'cell-info-chip name';
+      name.textContent = item.name;
+
+      const datetime = document.createElement('span');
+      datetime.className = 'cell-info-chip datetime';
+      datetime.textContent = item.date && item.time ? `${item.date} ${item.time}` : item.date || item.time || '';
+
+      const exif = document.createElement('span');
+      exif.className = 'cell-info-chip exif';
+      exif.textContent = item.exif || 'no exif info';
+
+      const meta = document.createElement('span');
+      meta.className = 'cell-info-meta';
+      meta.appendChild(datetime);
+      meta.appendChild(exif);
+
+      top.appendChild(name);
+      top.appendChild(meta);
+
+      const bottom = document.createElement('div');
+      bottom.className = 'cell-info-bottom';
+
+      const stars = document.createElement('span');
+      stars.className = 'cell-info-chip rating';
+      stars.textContent = ratingToStars(item.rating);
+      stars.style.cursor = 'pointer';
+
+      bottom.appendChild(stars);
+      info.appendChild(top);
+      info.appendChild(bottom);
+
+      cell.appendChild(img);
+      cell.appendChild(info);
+      frag.appendChild(cell);
+      imgObserver.observe(img);
+    }
+
+    grid.appendChild(frag);
+    setGridLoadingLabel(`Rendering grid (${end}/${total})`);
+    await nextAnimationFrame();
+  }
+
   updateSelectionStyles();
 }
 
@@ -799,16 +1082,11 @@ async function setRatingForSelection(rating) {
       }
     });
 
+    markPhotoStatsDirty();
     updatePhotoStats();
 
-    if (sortMode === 'rating-asc' || sortMode === 'rating-desc') {
-      const selectedPaths = new Set(getSelectedPaths());
-      const activePath = activeIndex >= 0 && activeIndex < imageList.length ? imageList[activeIndex].path : '';
-      const anchorPath = anchorIndex >= 0 && anchorIndex < imageList.length ? imageList[anchorIndex].path : '';
-      applyCurrentSort();
-      remapSelectionByPaths(selectedPaths, activePath, anchorPath);
-      renderGrid();
-      if (activeIndex !== -1) keepCellVisible(activeIndex);
+    if (shouldResortAfterRatingChange()) {
+      resortAndRefreshAfterRatingChange();
       return;
     }
 
@@ -921,7 +1199,13 @@ async function setRatingForIndex(imageIndex, rating) {
     if (!res.ok) throw new Error(res.statusText);
 
     imageList[imageIndex].rating = rating;
+    markPhotoStatsDirty();
     updatePhotoStats();
+
+    if (shouldResortAfterRatingChange()) {
+      resortAndRefreshAfterRatingChange(item.path);
+      return;
+    }
 
     const ratingNode = grid.querySelector(`.cell[data-index="${imageIndex}"] .cell-info-chip.rating`);
     if (ratingNode) {
@@ -958,12 +1242,31 @@ function addRangeSelection(fromIndex, toIndex) {
 }
 
 function updateSelectionStyles() {
-  const cells = grid.querySelectorAll('.cell');
-  cells.forEach((cell) => {
-    const index = Number(cell.dataset.index);
-    cell.classList.toggle('selected', selectedIndexes.has(index));
-    cell.classList.toggle('active', index === activeIndex);
+  previousSelectedIndexes.forEach((index) => {
+    if (selectedIndexes.has(index)) return;
+    const cell = grid.querySelector(`.cell[data-index="${index}"]`);
+    if (cell) cell.classList.remove('selected');
   });
+
+  selectedIndexes.forEach((index) => {
+    if (previousSelectedIndexes.has(index)) return;
+    const cell = grid.querySelector(`.cell[data-index="${index}"]`);
+    if (cell) cell.classList.add('selected');
+  });
+
+  if (previousActiveIndex !== activeIndex) {
+    if (previousActiveIndex >= 0) {
+      const previousCell = grid.querySelector(`.cell[data-index="${previousActiveIndex}"]`);
+      if (previousCell) previousCell.classList.remove('active');
+    }
+    if (activeIndex >= 0) {
+      const activeCell = grid.querySelector(`.cell[data-index="${activeIndex}"]`);
+      if (activeCell) activeCell.classList.add('active');
+    }
+  }
+
+  previousSelectedIndexes = new Set(selectedIndexes);
+  previousActiveIndex = activeIndex;
 }
 
 function handleCellSelection(index, event) {
@@ -1022,8 +1325,18 @@ function getArrowTargetIndex(key) {
 
 function keepCellVisible(index) {
   const cell = grid.querySelector(`.cell[data-index="${index}"]`);
-  if (!cell) return;
-  cell.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  if (cell) {
+    cell.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    return;
+  }
+
+  // Large redraws may be chunked; retry once on the next frame.
+  window.requestAnimationFrame(() => {
+    const delayedCell = grid.querySelector(`.cell[data-index="${index}"]`);
+    if (delayedCell) {
+      delayedCell.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+  });
 }
 
 function setKeyboardTarget(target) {
@@ -1158,45 +1471,7 @@ function fullPageNavigate(delta) {
 }
 
 async function setRatingForPhoto(index, rating) {
-  if (index < 0 || index >= imageList.length) return;
-  const item = imageList[index];
-
-  try {
-    const res = await fetch('/api/rate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths: [item.path], rating }),
-    });
-    if (!res.ok) throw new Error(res.statusText);
-
-    imageList[index].rating = rating;
-    updatePhotoStats();
-
-    if (fullPageIndex === index) {
-      updateFullPageBar();
-    }
-
-    if (sortMode === 'rating-asc' || sortMode === 'rating-desc') {
-      const currentPath = item.path;
-      const selectedPaths = new Set(getSelectedPaths());
-      const activePath = activeIndex >= 0 && activeIndex < imageList.length ? imageList[activeIndex].path : '';
-      const anchorPath = anchorIndex >= 0 && anchorIndex < imageList.length ? imageList[anchorIndex].path : '';
-      applyCurrentSort();
-      remapSelectionByPaths(selectedPaths, activePath, anchorPath);
-      fullPageIndex = imageList.findIndex((i) => i.path === currentPath);
-      renderGrid();
-      if (activeIndex !== -1) keepCellVisible(activeIndex);
-      return;
-    }
-
-    const cell = grid.querySelector(`.cell[data-index="${index}"]`);
-    if (cell) {
-      const ratingNode = cell.querySelector('.cell-info-chip.rating');
-      if (ratingNode) ratingNode.textContent = ratingToStars(rating);
-    }
-  } catch (error) {
-    console.error('Failed to set rating:', error);
-  }
+  await setRatingForIndex(index, rating);
 }
 
 function isNoModifier(event) {
@@ -1500,7 +1775,7 @@ groupNamePrefixInput.addEventListener('change', () => {
 groupNamePrefixInput.addEventListener('input', () => {
   setNameGroupingPrefixLength(groupNamePrefixInput.value);
   localStorage.setItem('nameGroupingPrefixLength', String(nameGroupingPrefixLength));
-  renderGrid();
+  debouncedGroupNameRender();
 });
 
 downloadBtn.addEventListener('click', () => {
@@ -1555,7 +1830,15 @@ async function loadImages(dir) {
   currentDir = dir || '';
   imageLoadRequestId += 1;
   const requestId = imageLoadRequestId;
-  setGridLoading(true);
+  const loadId = createImageLoadId();
+  stopImageLoadProgressPolling();
+  setGridLoading(true, 'Preparing folder...');
+  imageList = [];
+  markPhotoStatsDirty();
+  setDefaultSelection();
+  renderGrid();
+  gallery.scrollTop = 0;
+  pollImageLoadProgress(loadId, requestId);
 
   if (imageLoadController) {
     imageLoadController.abort();
@@ -1563,25 +1846,39 @@ async function loadImages(dir) {
   imageLoadController = new AbortController();
 
   try {
-    const res = await fetch(`/api/images?dir=${encodeURIComponent(dir)}`, {
+    const res = await fetch(`/api/images?dir=${encodeURIComponent(dir)}&load_id=${encodeURIComponent(loadId)}`, {
       signal: imageLoadController.signal,
     });
     if (!res.ok) throw new Error(res.statusText);
     if (requestId !== imageLoadRequestId) return;
+    setGridLoadingLabel('Receiving image list...');
     imageList = await res.json();
+    markPhotoStatsDirty();
     if (requestId !== imageLoadRequestId) return;
+    setGridLoadingLabel('Sorting images...');
     applyCurrentSort();
   } catch (e) {
     if (requestId !== imageLoadRequestId) return;
     if (e.name === 'AbortError') return;
     imageList = [];
     console.error('Failed to load images:', e);
+  } finally {
+    if (requestId === imageLoadRequestId) {
+      stopImageLoadProgressPolling();
+    }
   }
   if (requestId !== imageLoadRequestId) return;
   setDefaultSelection();
-  renderGrid();
+  if (imageList.length > LARGE_GRID_CHUNK_THRESHOLD) {
+    const renderEpoch = ++gridRenderEpoch;
+    await renderGridChunked(requestId, 600, renderEpoch);
+    if (requestId !== imageLoadRequestId) return;
+    setGridLoading(false);
+  } else {
+    setGridLoading(false);
+    renderGrid();
+  }
   gallery.scrollTop = 0;
-  setGridLoading(false);
 }
 
 /* ── Directory tree ─────────────────────────────────────────── */
@@ -1620,6 +1917,7 @@ function buildTreeNode(item) {
   node.appendChild(children);
 
   let loaded = false;
+  let isExpanded = false;
 
   async function toggleExpand() {
     if (!item.hasChildren) return;
@@ -1634,8 +1932,10 @@ function buildTreeNode(item) {
         console.error('Failed to load tree children:', e);
       }
     }
-    const open = children.classList.toggle('open');
-    toggle.classList.toggle('open', open);
+    // Toggle the expanded state
+    isExpanded = !isExpanded;
+    children.classList.toggle('open', isExpanded);
+    toggle.classList.toggle('open', isExpanded);
   }
 
   toggle.addEventListener('click', (e) => {
@@ -1696,17 +1996,78 @@ async function initTree() {
 /* ── Sidebar resize ──────────────────────────────────────────── */
 const resizeHandle = document.getElementById('sidebar-resize-handle');
 let isResizing = false;
+let resizePointerId = null;
 let startX = 0;
 let startWidth = 0;
 let sidebarWidth = sidebar.offsetWidth || 260;
+let pendingSidebarWidth = null;
+let sidebarResizeRafId = 0;
 
 function applySidebarWidth(width) {
   const maxWidth = Math.floor(window.innerWidth * 0.7);
   const clamped = Math.max(200, Math.min(width, maxWidth));
   sidebarWidth = clamped;
   if (!sidebar.classList.contains('hidden')) {
-    sidebar.style.width = clamped + 'px';
+    const nextWidth = `${clamped}px`;
+    if (sidebar.style.width !== nextWidth) {
+      sidebar.style.width = nextWidth;
+    }
   }
+}
+
+function flushSidebarResize() {
+  sidebarResizeRafId = 0;
+  if (pendingSidebarWidth == null) return;
+  applySidebarWidth(pendingSidebarWidth);
+  pendingSidebarWidth = null;
+}
+
+function queueSidebarWidth(width) {
+  pendingSidebarWidth = width;
+  if (sidebarResizeRafId !== 0) return;
+  sidebarResizeRafId = requestAnimationFrame(flushSidebarResize);
+}
+
+function beginSidebarResize(event) {
+  if (sidebar.classList.contains('hidden')) return;
+
+  isResizing = true;
+  resizePointerId = event.pointerId;
+  startX = event.clientX;
+  startWidth = sidebar.offsetWidth;
+  resizeHandle.classList.add('resizing');
+  document.body.style.cursor = 'ew-resize';
+  document.body.style.userSelect = 'none';
+  sidebar.style.transition = 'none';
+
+  if (typeof resizeHandle.setPointerCapture === 'function') {
+    try {
+      resizeHandle.setPointerCapture(event.pointerId);
+    } catch (_) {
+      // Ignore capture failures and continue with document-level listeners.
+    }
+  }
+}
+
+function endSidebarResize() {
+  if (!isResizing) return;
+
+  isResizing = false;
+  resizePointerId = null;
+
+  if (sidebarResizeRafId !== 0) {
+    cancelAnimationFrame(sidebarResizeRafId);
+    sidebarResizeRafId = 0;
+  }
+  if (pendingSidebarWidth != null) {
+    applySidebarWidth(pendingSidebarWidth);
+    pendingSidebarWidth = null;
+  }
+
+  resizeHandle.classList.remove('resizing');
+  document.body.style.cursor = '';
+  document.body.style.userSelect = '';
+  sidebar.style.transition = '';
 }
 
 function toggleSidebarVisibility() {
@@ -1729,37 +2090,42 @@ sidebarBtn.addEventListener('click', () => {
   toggleSidebarVisibility();
 });
 
-resizeHandle.addEventListener('mousedown', (e) => {
-  if (sidebar.classList.contains('hidden')) return;
-  isResizing = true;
-  startX = e.clientX;
-  startWidth = sidebar.offsetWidth;
-  resizeHandle.classList.add('resizing');
-  document.body.style.cursor = 'ew-resize';
-  document.body.style.userSelect = 'none';
-  sidebar.style.transition = 'none';
+resizeHandle.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  beginSidebarResize(event);
 });
 
-document.addEventListener('mousemove', (e) => {
+document.addEventListener('pointermove', (event) => {
   if (!isResizing) return;
-  const diff = e.clientX - startX;
-  applySidebarWidth(startWidth - diff);
+  if (resizePointerId !== null && event.pointerId !== resizePointerId) return;
+
+  const diff = event.clientX - startX;
+  queueSidebarWidth(startWidth - diff);
 });
 
-document.addEventListener('mouseup', () => {
+document.addEventListener('pointerup', (event) => {
   if (!isResizing) return;
-  isResizing = false;
-  resizeHandle.classList.remove('resizing');
-  document.body.style.cursor = '';
-  document.body.style.userSelect = '';
-  sidebar.style.transition = '';
+  if (resizePointerId !== null && event.pointerId !== resizePointerId) return;
+  endSidebarResize();
 });
 
-window.addEventListener('resize', () => {
-  if (!sidebar.classList.contains('hidden')) {
-    applySidebarWidth(sidebarWidth);
+document.addEventListener('pointercancel', (event) => {
+  if (!isResizing) return;
+  if (resizePointerId !== null && event.pointerId !== resizePointerId) return;
+  endSidebarResize();
+});
+
+window.addEventListener('blur', () => {
+  endSidebarResize();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') {
+    endSidebarResize();
   }
 });
+
 
 gallery.addEventListener('click', () => {
   setKeyboardTarget('grid');
@@ -1803,6 +2169,10 @@ updateSecondarySortButton();
 initTree();
 setKeyboardTarget('grid');
 
-window.addEventListener('resize', () => {
-  fitStatsBarToWidth();
-});
+// Use ResizeObserver to efficiently track stats bar width changes
+if (statsBarWrap) {
+  const resizeObserver = new ResizeObserver(() => {
+    fitStatsBarToWidth();
+  });
+  resizeObserver.observe(statsBarWrap);
+}

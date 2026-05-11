@@ -296,16 +296,18 @@ body[data-keyboard-target="grid"] #gallery {
 }
 
 #grid[data-loading="true"]::before {
-  content: "Loading images...";
+  content: attr(data-loading-label);
   position: absolute;
   inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
+  text-align: center;
   background: color-mix(in srgb, var(--bg-body) 72%, transparent);
   color: var(--fg-body);
   font-size: 0.9rem;
   font-weight: 600;
+  white-space: pre-wrap;
   z-index: 5;
   backdrop-filter: blur(1.5px);
 }
@@ -339,6 +341,9 @@ body[data-keyboard-target="grid"] #gallery {
   border-radius: 2px;
   border: 1px solid transparent;
   position: relative;
+  contain: layout paint style;
+  content-visibility: auto;
+  contain-intrinsic-size: 220px 220px;
 }
 
 .cell.selected {
@@ -712,6 +717,7 @@ body[data-keyboard-target="tree"] #sidebar:not(.hidden) {
   background: var(--border-strong);
   cursor: ew-resize;
   user-select: none;
+  touch-action: none;
   flex-shrink: 0;
   transition: background 0.15s ease;
   position: relative;

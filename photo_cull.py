@@ -17,6 +17,8 @@ Requirements
 import io
 import sqlite3
 import sys
+import threading
+import time
 import zipfile
 import cherrypy
 from html import escape
@@ -132,10 +134,11 @@ class ApiHandler:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def images(self, dir=""):
+    def images(self, dir="", load_id=""):
         """Return image files in *dir* (relative to base_dir).
         Each item: {name, path, date, time, exif, rating}
         """
+        load_id = str(load_id or "").strip()
         try:
             abs_dir = safe_join(self._app.base_dir, dir)
         except ValueError:
@@ -148,9 +151,35 @@ class ApiHandler:
         except PermissionError:
             return result
         image_entries = [e for e in entries if e.is_file() and is_image_file(e.name)]
-        self._app._sync_directory_metadata(abs_dir, image_entries)
-        for entry in entries:
-            if entry.is_file() and is_image_file(entry.name):
+        total_images = len(image_entries)
+        self._app._set_load_progress(
+            load_id,
+            phase="Checking metadata",
+            processed=0,
+            total=total_images,
+            done=False,
+        )
+
+        try:
+            self._app._sync_directory_metadata(
+                abs_dir,
+                image_entries,
+                progress_callback=lambda processed, total: self._app._set_load_progress(
+                    load_id,
+                    phase="Checking metadata",
+                    processed=processed,
+                    total=total,
+                    done=False,
+                ),
+            )
+            self._app._set_load_progress(
+                load_id,
+                phase="Loading images",
+                processed=0,
+                total=total_images,
+                done=False,
+            )
+            for index, entry in enumerate(image_entries, start=1):
                 rel_path = str(entry.relative_to(self._app.base_dir)).replace("\\", "/")
                 modified_date, modified_time, exif_info = self._app._get_image_metadata_for_images(entry)
                 rating = self._app._get_rating(entry)
@@ -162,7 +191,38 @@ class ApiHandler:
                     "exif": exif_info,
                     "rating": rating,
                 })
+                self._app._set_load_progress(
+                    load_id,
+                    phase="Loading images",
+                    processed=index,
+                    total=total_images,
+                    done=False,
+                )
+        except Exception as exc:
+            self._app._set_load_progress(
+                load_id,
+                phase="Failed to load images",
+                processed=0,
+                total=total_images,
+                done=True,
+                error=str(exc),
+            )
+            raise
+
+        self._app._set_load_progress(
+            load_id,
+            phase="Loaded images",
+            processed=total_images,
+            total=total_images,
+            done=True,
+        )
         return result
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def load_progress(self, load_id=""):
+        """Return folder image-loading progress for a client-generated request id."""
+        return self._app._get_load_progress(load_id)
 
     @cherrypy.expose
     @cherrypy.tools.json_in()
@@ -284,6 +344,8 @@ class PhotoCullingApp:
         self.db_path = self.data_dir / ".ratings.db"
         self.cache_dir = self.data_dir / ".cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._load_progress_lock = threading.Lock()
+        self._load_progress: dict[str, dict] = {}
         self._init_db()
         self.api = ApiHandler(self)
 
@@ -404,7 +466,12 @@ class PhotoCullingApp:
                 (key, date or "", time or "", exif or ""),
             )
 
-    def _sync_directory_metadata(self, abs_dir: Path, image_entries: list[Path]):
+    def _sync_directory_metadata(
+        self,
+        abs_dir: Path,
+        image_entries: list[Path],
+        progress_callback=None,
+    ):
         """Ensure metadata rows mirror files in a directory, preserving stored creation dates."""
         dir_rel = str(abs_dir.relative_to(self.base_dir)).replace("\\", "/")
         if dir_rel == ".":
@@ -421,9 +488,12 @@ class PhotoCullingApp:
                 if parent_dir == dir_rel and db_key not in current_keys:
                     con.execute("DELETE FROM image_metadata WHERE path = ?", (db_key,))
 
-            for entry in image_entries:
+            total_entries = len(image_entries)
+            for index, entry in enumerate(image_entries, start=1):
                 key = self._rating_key(entry)
                 if key in existing_keys:
+                    if progress_callback is not None:
+                        progress_callback(index, total_entries)
                     continue
                 shot_date, shot_time, exif_info = self._extract_exif_metadata_from_file(entry)
                 if shot_date and shot_time:
@@ -434,6 +504,75 @@ class PhotoCullingApp:
                     "INSERT INTO image_metadata (path, date, time, exif) VALUES (?, ?, ?, ?)",
                     (key, created_date, created_time, exif_info),
                 )
+                if progress_callback is not None:
+                    progress_callback(index, total_entries)
+
+    def _set_load_progress(
+        self,
+        load_id: str,
+        *,
+        phase: str,
+        processed: int,
+        total: int,
+        done: bool,
+        error: str = "",
+    ):
+        """Store coarse progress state for a single in-flight folder load."""
+        if not load_id:
+            return
+        now = time.time()
+        progress = {
+            "phase": phase,
+            "processed": max(0, int(processed)),
+            "total": max(0, int(total)),
+            "done": bool(done),
+            "error": error,
+            "updated_at": now,
+        }
+        with self._load_progress_lock:
+            self._prune_load_progress_locked(now)
+            self._load_progress[load_id] = progress
+
+    def _get_load_progress(self, load_id: str):
+        """Return progress snapshot for a folder load request."""
+        if not load_id:
+            return {
+                "phase": "Loading images",
+                "processed": 0,
+                "total": 0,
+                "done": False,
+                "error": "",
+            }
+        now = time.time()
+        with self._load_progress_lock:
+            self._prune_load_progress_locked(now)
+            progress = self._load_progress.get(load_id)
+        if progress is None:
+            return {
+                "phase": "Loading images",
+                "processed": 0,
+                "total": 0,
+                "done": False,
+                "error": "",
+            }
+        return {
+            "phase": progress["phase"],
+            "processed": progress["processed"],
+            "total": progress["total"],
+            "done": progress["done"],
+            "error": progress["error"],
+        }
+
+    def _prune_load_progress_locked(self, now: float):
+        """Remove stale progress snapshots from older folder loads."""
+        cutoff = now - 300
+        stale_ids = [
+            load_id
+            for load_id, progress in self._load_progress.items()
+            if progress.get("updated_at", 0) < cutoff
+        ]
+        for load_id in stale_ids:
+            self._load_progress.pop(load_id, None)
 
     def _get_image_metadata_for_images(self, abs_path: Path):
         """Return metadata for /images using DB first, then mtime fallback."""
